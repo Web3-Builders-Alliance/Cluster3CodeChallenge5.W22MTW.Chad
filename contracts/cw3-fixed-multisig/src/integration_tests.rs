@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use cosmwasm_std::{to_binary, Addr, Empty, Uint128, WasmMsg};
+use cosmwasm_std::{to_binary, Addr, Empty, QuerierWrapper, Uint128, WasmMsg};
 use cw20::{BalanceResponse, MinterResponse};
 use cw20_base::msg::QueryMsg;
 use cw3::Vote;
@@ -10,7 +10,7 @@ use cw_utils::{Duration, Threshold};
 use crate::contract::{execute, instantiate, query};
 use crate::msg::{ExecuteMsg, InstantiateMsg, Voter};
 
-use counter::{self, helpers::CounterContract};
+use counter;
 
 fn mock_app() -> App {
     App::default()
@@ -165,6 +165,14 @@ fn cw3_controls_cw20() {
     assert_eq!(balance.balance, mint_amount);
 }
 
+fn get_count(querier: QuerierWrapper, counter_addr: &Addr) -> i32 {
+    let counter_value_query = counter::msg::QueryMsg::GetCount {};
+    let count: counter::msg::GetCountResponse = querier
+        .query_wasm_smart(counter_addr, &counter_value_query)
+        .unwrap();
+    count.count
+}
+
 #[test]
 fn cw3_3_of_5_multisig() {
     let mut router = mock_app();
@@ -234,86 +242,88 @@ fn cw3_3_of_5_multisig() {
         )
         .unwrap();
 
-    // increment counter according to proposal result
-    let counter_increment_msg = counter::msg::ExecuteMsg::Increment {};
-
-    let execute_increment_msg = WasmMsg::Execute {
-        contract_addr: counter_addr.to_string(),
-        msg: to_binary(&counter_increment_msg).unwrap(),
-        funds: vec![],
-    };
-    let propose_msg = ExecuteMsg::Propose {
-        title: "Increment".to_string(),
-        description: "Let's increment the counter!".to_string(),
-        msgs: vec![execute_increment_msg.into()],
-        latest: None,
-    };
-    // propose increment
-    router
-        .execute_contract(addr1.clone(), multisig_addr.clone(), &propose_msg, &[])
-        .unwrap();
-
-    // second vote
-    let vote2_msg = ExecuteMsg::Vote {
-        proposal_id: 1,
-        vote: Vote::Yes,
-    };
-    let res = router.execute_contract(addr2, multisig_addr.clone(), &vote2_msg, &[]);
-    assert!(res.is_ok());
-
-    // only 2 votes and msg increment fails
-    let execute_proposal_msg = ExecuteMsg::Execute { proposal_id: 1 };
-    // execute increment
-    let res = router.execute_contract(
+    // propose an increment; addr1 proposes & auto-votes Yes
+    let proposal = router.execute_contract(
         addr1.clone(),
         multisig_addr.clone(),
-        &execute_proposal_msg,
+        &ExecuteMsg::Propose {
+            title: "Increment".to_string(),
+            description: "Let's increment the counter!".to_string(),
+            msgs: vec![WasmMsg::Execute {
+                contract_addr: counter_addr.to_string(),
+                msg: to_binary(&counter::msg::ExecuteMsg::Increment {}).unwrap(),
+                funds: vec![],
+            }
+            .into()],
+            latest: None,
+        },
         &[],
     );
-    assert!(res.is_err());
+    assert!(proposal.is_ok());
 
-    // check if increment is successful
-    let counter_value_query = counter::msg::QueryMsg::GetCount {};
-    let count: counter::msg::GetCountResponse = router
-        .wrap()
-        .query_wasm_smart(&counter_addr, &counter_value_query)
-        .unwrap();
+    let addr2_votes_yes = router.execute_contract(
+        addr2.clone(),
+        multisig_addr.clone(),
+        &ExecuteMsg::Vote {
+            proposal_id: 1,
+            vote: Vote::Yes,
+        },
+        &[],
+    );
+    assert!(addr2_votes_yes.is_ok());
 
-    // compare counter
-    assert_eq!(count.count, 0);
+    // only 2 votes and executing increment fails
+    assert!(router
+        .execute_contract(
+            addr1.clone(),
+            multisig_addr.clone(),
+            &ExecuteMsg::Execute { proposal_id: 1 },
+            &[],
+        )
+        .is_err());
+    assert_eq!(get_count(router.wrap(), &counter_addr), 0);
 
-    let vote3_msg = ExecuteMsg::Vote {
-        proposal_id: 1,
-        vote: Vote::Yes,
-    };
-    let res = router.execute_contract(addr3, multisig_addr.clone(), &vote3_msg, &[]);
-    assert!(res.is_ok());
+    let addr3_votes_no = router.execute_contract(
+        addr3.clone(),
+        multisig_addr.clone(),
+        &ExecuteMsg::Vote {
+            proposal_id: 1,
+            vote: Vote::No,
+        },
+        &[],
+    );
+    assert!(addr3_votes_no.is_ok());
+
+    // only 2 yes votes, increment still fails
+    assert!(router
+        .execute_contract(
+            addr1.clone(),
+            multisig_addr.clone(),
+            &ExecuteMsg::Execute { proposal_id: 1 },
+            &[],
+        )
+        .is_err());
+    assert_eq!(get_count(router.wrap(), &counter_addr), 0);
+
+    let addr4_votes_yes = router.execute_contract(
+        addr4,
+        multisig_addr.clone(),
+        &ExecuteMsg::Vote {
+            proposal_id: 1,
+            vote: Vote::Yes,
+        },
+        &[],
+    );
+    assert!(addr4_votes_yes.is_ok());
 
     // now 3 votes and msg increment passes!
-    let execute_proposal_msg = ExecuteMsg::Execute { proposal_id: 1 };
-    // execute increment
-    let res = router.execute_contract(
-        addr1.clone(),
-        multisig_addr.clone(),
-        &execute_proposal_msg,
-        &[],
-    );
-    assert!(res.is_ok());
-
-    // check if increment is successful
-    let counter_value_query = counter::msg::QueryMsg::GetCount {};
-    let count: counter::msg::GetCountResponse = router
-        .wrap()
-        .query_wasm_smart(&counter_addr, &counter_value_query)
-        .unwrap();
-
-    // compare counter
-    assert_eq!(count.count, 1);
+    assert!(router
+        .execute_contract(
+            addr1.clone(),
+            multisig_addr.clone(),
+            &ExecuteMsg::Execute { proposal_id: 1 },
+            &[],
+        )
+        .is_ok());
+    assert_eq!(get_count(router.wrap(), &counter_addr), 1);
 }
-
-//CW3 Controls Counter
-// #[test]
-// fn cw3_controls_counter() {
-//     //CODING CHALLENEGE
-//     unimplemented!()
-// }
